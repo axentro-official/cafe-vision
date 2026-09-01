@@ -1,0 +1,5 @@
+# بيانات التشغيل المحلية - متترفعش
+cafe.db
+zones.json
+__pycache__/
+*.pyc
