@@ -1,4 +1,4 @@
-# الخطوة 6 (نسخة 4.3 النهائية) - شكل احترافي + تعليم الباريستا بالبصمة + رقم ثابت للبصمة
+# الخطوة 6 (نسخة 4.5) - فلتر ذكي: الثابت لو طابقه بصمة = شخص! + فحص أولي أسرع
 import cv2
 import numpy as np
 import time
@@ -10,33 +10,39 @@ from ultralytics import YOLO
 
 # ================= إعدادات قابلة للتعديل =================
 MODEL_NAME = "yolo11s.pt"   # لو جهازك بطيء: رجّعها "yolo11n.pt"
-                            # في الإنتاج الحقيقي (GPU/Edge): yolo11m.pt أو yolo11l.pt
 
 # مصدر الكاميرا:
 #   0                = كاميرا اللابتوب
 #   "rtsp://..."     = كاميرا IP حقيقية (أي كاميرا مراقبة ONVIF حديثة)
-# مثال: "rtsp://admin:password@192.168.1.10:554/stream1"
 CAMERA_SOURCE = 0
 
 ZONES_FILE = "zones.json"
 
-GREEN_UPTO         = 60      # أخضر لحد 60 ثانية
-YELLOW_UPTO        = 90      # أصفر من 60 لـ 90 | بعدها أحمر
+GREEN_UPTO         = 60
+YELLOW_UPTO        = 90
 MIN_CONF           = 0.50
 CUP_CONF           = 0.35
 MIN_AREA_PCT       = 0.015
 MIN_FRAMES         = 8
-GONE_AFTER         = 15.0    # غاب كام ثانية = خرج رسمي (لحظة التأكيد)
+GONE_AFTER         = 15.0
 BARISTA_MIN_TIME   = 10.0
 BARISTA_ZONE_RATIO = 0.6
 DWELL_SECONDS      = 4.0
 CUP_NEAR_PCT       = 0.40
-ZONE_FILL_ALPHA    = 0.18    # شفافية تعبئة المنطقة
+ZONE_FILL_ALPHA    = 0.18
 
 # ---------- تعليم الباريستا (بصمة الملابس) ----------
-ENROLL_KEY         = 'e'     # اضغط E وإنت قاعد جوه الكادر عشان تسجل نفسك
-APPEAR_THRESHOLD   = 0.45    # لو التعرف غلط: ارفعها 0.55 | لو مش بيجيب: نقّلها 0.40
+ENROLL_KEY         = 'e'
+APPEAR_THRESHOLD   = 0.45
 HIST_BINS          = 16
+
+# ---------- فلتر الأجسام الثابتة ----------
+STATIC_AFTER    = 6.0    # بعد كام ثانية نبدأ نفحص الحركة
+STATIC_MOVE_PX  = 20     # الحد الأدنى للحركة (بكسل)
+STATIC_CHECK_INTERVAL = 1.0  # بنفحص كل ثانية مش كل فريم (توفير معالجة)
+
+# ---------- فترة سماح العميل ----------
+CUSTOMER_GRACE  = 2.0    # ثواني قبل حكم نهائي على شخص جديد
 
 GREEN  = (0, 200, 0)
 YELLOW = (0, 220, 220)
@@ -45,18 +51,18 @@ BLUE   = (255, 160, 0)
 ORANGE = (0, 140, 255)
 DARK   = (30, 30, 30)
 WHITE  = (255, 255, 255)
+GRAY   = (140, 140, 140)
+PURPLE = (200, 60, 200)   # لون "إنسان ثابت" (مهم - مش أجسام)
 
 model = YOLO(MODEL_NAME)
 
 # ================= دوال الرسم الاحترافية =================
 def text_color_for(bgr):
-    """نص أسود على الخلفيات الفاتحة، أبيض على الغامقة"""
     b, g, r = bgr
     lum = 0.299 * r + 0.587 * g + 0.114 * b
     return (0, 0, 0) if lum > 150 else (255, 255, 255)
 
 def draw_badge(img, text, x, y, bg_color, font_scale=0.55):
-    """بادج معبأ بلون - النقطة (x,y) هي أسفل-شمال البادج"""
     (tw, th), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 2)
     pad = 5
     bx1 = x
@@ -71,9 +77,20 @@ def draw_badge(img, text, x, y, bg_color, font_scale=0.55):
 def box_center(box):
     return (int((box[0] + box[2]) / 2), int((box[1] + box[3]) / 2))
 
-# ---------- بصمة الملابس (numpy مباشرة - متوافقة مع OpenCV 5) ----------
+def iou(a, b):
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+    inter = iw * ih
+    area_a = (ax2 - ax1) * (ay2 - ay1)
+    area_b = (bx2 - bx1) * (by2 - by1)
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+# ---------- بصمة الملابس (numpy مباشرة) ----------
 def extract_appearance(frame, box):
-    """بصمة لونية للجذع - بترجع None لو مفيش مقطع صالح"""
     try:
         fh, fw = frame.shape[:2]
         x1, y1, x2, y2 = [int(v) for v in box]
@@ -81,13 +98,11 @@ def extract_appearance(frame, box):
         y1, y2 = max(0, y1), min(fh, y2)
         w, h = x2 - x1, y2 - y1
         if w < 10 or h < 10:
-            print(f"   [debug] المربع صغير جداً: {w}x{h} بكسل")
             return None
         top = max(0, y1 + int(h * 0.10))
         bot = max(0, y1 + int(h * 0.60))
         crop = frame[top:bot, x1:x2]
         if crop is None or crop.size == 0 or crop.shape[0] < 5 or crop.shape[1] < 5:
-            print(f"   [debug] مقطع فاضي: top={top} bot={bot} x1={x1} x2={x2}")
             return None
         hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
         hue = hsv[:, :, 0].ravel().astype(np.float32)
@@ -97,15 +112,12 @@ def extract_appearance(frame, box):
         hist = np.concatenate([hist_h, hist_v]).astype(np.float32)
         total = hist.sum()
         if total <= 0:
-            print("   [debug] البصمة فاضية (الصورة سودا؟)")
             return None
         return hist / total
-    except Exception as e:
-        print(f"   [debug] خطأ حقيقي في البصمة: {e}")
+    except Exception:
         return None
 
 def appearance_match(h1, h2):
-    """نسبة التشابه (correlation) — numpy مباشرة، متوافقة مع أي نسخة"""
     try:
         h1 = h1.flatten().astype(np.float32)
         h2 = h2.flatten().astype(np.float32)
@@ -117,6 +129,17 @@ def appearance_match(h1, h2):
         return float((h1m * h2m).sum() / denom)
     except Exception:
         return 0.0
+
+# ---------- فلتر الثبات ----------
+def _is_static_now(hist, start, now_t):
+    """هل الشخص ده ثابت مكانه منذ ظهوره؟"""
+    age = now_t - start
+    if age <= STATIC_AFTER or len(hist) < 2:
+        return False
+    first = hist[0]
+    last = hist[-1]
+    moved = max(abs(last[0] - first[0]), abs(last[1] - first[1]))
+    return moved < STATIC_MOVE_PX
 
 # ================= قاعدة البيانات =================
 conn = sqlite3.connect("cafe.db", timeout=10)
@@ -156,8 +179,11 @@ pending = {}
 pending_barista = {}
 barista_no, orders = {}, {}
 next_barista = 1
-enrolled_signatures = []   # بصمات الباريستات المسجلين (زرار E)
-announced_baristas = set() # أرقام الباريستات اللي أعلنّا عنها الجلسة دي
+enrolled_signatures = []
+announced_baristas = set()
+center_history = {}
+sig_checked = {}
+last_static_check = {}   # توقيت آخر فحص ثبات لكل شخص
 
 # ================= دوال =================
 def save_visit(cno, entry, exit_t):
@@ -174,7 +200,6 @@ def save_visit(cno, entry, exit_t):
     return True
 
 def confirm_delivery(cno, b_tid):
-    """التأكيد النهائي - بيحصل فقط لما العميل يخرج من الكادر"""
     bno = barista_no.get(b_tid) if b_tid is not None else None
     if b_tid is not None:
         orders[b_tid] = orders.get(b_tid, 0) + 1
@@ -204,9 +229,8 @@ if not ret:
 
 cv2.namedWindow("Cafe Vision", cv2.WINDOW_AUTOSIZE)
 
-# ================= تحديد منطقة الباريستا (مضلع 4 نقاط) =================
+# ================= تحديد منطقة الباريستا =================
 def pick_zone_poly(src_frame):
-    """المستخدم بينقر 4 نقاط حول الكاونتر | ENTER=حفظ R=إعادة ESC=تخطي"""
     pts = []
     win = "Click 4 corners around the counter | ENTER=Save  R=Reset  ESC=Skip"
     def on_mouse(event, x, y, flags, param):
@@ -242,16 +266,14 @@ if os.path.exists(ZONES_FILE):
     if "barista_poly" in data:
         zone_poly = [tuple(p) for p in data["barista_poly"]]
     else:
-        # توافق مع الملف القديم (مستطيل) — نحوله لمضلع
         x, y, w, h = data["barista"]
         zone_poly = [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
-    # تحميل بصمات الباريستا المحفوظة
     if "barista_signatures" in data:
         for flat in data["barista_signatures"]:
             enrolled_signatures.append(np.array(flat, np.float32))
         next_barista = len(enrolled_signatures) + 1
     print(f"المنطقة المحفوظة: {zone_poly}")
-    print(f"بصمات باريستا محفوظة: {len(enrolled_signatures)} (لإعادة الكل من الأول: امسح zones.json)")
+    print(f"بصمات باريستا محفوظة: {len(enrolled_signatures)} (لإعادة الكل: امسح zones.json)")
 else:
     print(">>> انقر 4 زوايا حول منطقة الكاونتر ثم ENTER <<<")
     zone_poly = pick_zone_poly(frame)
@@ -262,7 +284,6 @@ else:
         print("مفيش منطقة - الكل هيتعامل كعملاء")
 
 def save_signatures():
-    """حفظ بصمات الباريستا في zones.json (تعيش بعد إقفال البرنامج)"""
     data = {}
     if os.path.exists(ZONES_FILE):
         data = json.load(open(ZONES_FILE))
@@ -278,7 +299,7 @@ def in_zone(cx, cy):
 
 last_t = time.time()
 fps_smooth = 0.0
-print("الكاميرا بتشتغل... اضغط Q للخروج | اضغط E عشان تسجل الباريستا اللي قدام الكاميرا")
+print("الكاميرا بتشتغل... اضغط Q للخروج | اضغط E لتعليم الباريستا")
 
 while True:
     ret, frame = cap.read()
@@ -307,7 +328,7 @@ while True:
     fh, fw = frame.shape[:2]
     min_area = MIN_AREA_PCT * fh * fw
 
-    # ---------- المنطقة: مضلع شفاف + بادج ----------
+    # ---------- المنطقة ----------
     if zone_contour is not None:
         overlay = annotated.copy()
         cv2.fillPoly(overlay, [zone_contour], BLUE)
@@ -327,9 +348,23 @@ while True:
         for b, c, cf, i in zip(boxes_all, clss, confs, ids_all):
             name = model.names[c]
             if name == "person" and cf >= MIN_CONF and (b[2]-b[0])*(b[3]-b[1]) >= min_area and i is not None:
-                person_dets.append((i, b))
+                person_dets.append((i, b, cf))
             elif name == "cup" and cf >= CUP_CONF:
                 cup_boxes.append(b)
+
+    # ---------- تنظيف المربعات المكررة ----------
+    if len(person_dets) > 1:
+        person_dets.sort(key=lambda d: -d[2])
+        kept = []
+        for tid, b, cf in person_dets:
+            dup = False
+            for k_tid, k_b, k_cf in kept:
+                if iou(b, k_b) > 0.70:
+                    dup = True
+                    break
+            if not dup:
+                kept.append((tid, b, cf))
+        person_dets = kept
 
     for b in cup_boxes:
         x1, y1, x2, y2 = map(int, b)
@@ -339,14 +374,18 @@ while True:
     confirmed = []
     current_baristas = []
     person_boxes = {}
+    matched_barista_ids = set()   # كل الباريستات اللي اتفكروا في الفريم ده
 
-    for tid, box in person_dets:
+    for tid, box, _conf in person_dets:
         x1, y1, x2, y2 = map(int, box)
         confirmed.append(tid)
         person_boxes[tid] = box
         seen_frames[tid] = seen_frames.get(tid, 0) + 1
         if tid not in wait_start:
             wait_start[tid] = now
+            center_history[tid] = []
+            sig_checked[tid] = False
+            last_static_check[tid] = 0
         last_seen[tid] = now
 
         cx, cy = box_center(box)
@@ -357,38 +396,41 @@ while True:
 
         ratio = (zone_time.get(tid, 0) / total_time[tid]) if total_time.get(tid) else 0
 
-        # ---------- ترتيب التعرف: بصمة الملابس أولاً، ثم المنطقة، وأخيراً عميل ----------
+        # ---------- بناء بصمة عينة (بنحتاجها في كل مكان تقريباً) ----------
+        current_sig = extract_appearance(frame, box) if enrolled_signatures else None
+        if current_sig is not None:
+            sig_checked[tid] = True
+
+        # ---------- 1) البصمة: أقوى طريقة أولًا ----------
         enrolled_match = False
         matched_sig_idx = -1
         is_barista = tid in barista_no
 
-        if not is_barista and enrolled_signatures:
-            sig = extract_appearance(frame, box)
-            if sig is not None:
-                sims = [appearance_match(sig, es) for es in enrolled_signatures]
-                best_idx = int(np.argmax(sims))
-                if sims[best_idx] >= APPEAR_THRESHOLD:
-                    enrolled_match = True
-                    matched_sig_idx = best_idx
-                    is_barista = True
+        if not is_barista and current_sig is not None:
+            sims = [appearance_match(current_sig, es) for es in enrolled_signatures]
+            best_idx = int(np.argmax(sims))
+            if sims[best_idx] >= APPEAR_THRESHOLD:
+                enrolled_match = True
+                matched_sig_idx = best_idx
+                is_barista = True
 
+        # ---------- 2) المنطقة ----------
         if not is_barista and total_time[tid] >= BARISTA_MIN_TIME and ratio >= BARISTA_ZONE_RATIO:
             is_barista = True
 
         if is_barista:
             if tid not in barista_no:
                 if enrolled_match:
-                    # رقم ثابت مرتبط بالبصمة: البصمة الأولى = Barista #1 دايماً
                     barista_no[tid] = matched_sig_idx + 1
                 else:
                     barista_no[tid] = next_barista
                     next_barista += 1
             bno = barista_no[tid]
+            matched_barista_ids.add(bno)
             if bno not in announced_baristas:
                 announced_baristas.add(bno)
                 how = "بالبصمة (ملابسه)" if enrolled_match else "بمنطقة العمل"
                 print(f"👨‍🍳 باريستا انضم: Barista #{bno} ({how})")
-            # ننضف أي أثر إنه اتلخبط عميل قبل كده
             customer_no.pop(tid, None)
             wait_start.pop(tid, None)
             dwell.pop(tid, None)
@@ -400,13 +442,36 @@ while True:
                        x1, y1 - 4, BLUE)
             continue
 
-        # مش باريستا -> نكمل كعميل
-        if tid not in customer_no and seen_frames[tid] >= MIN_FRAMES:
+        # ---------- فلتر الأجسام الثابتة (بذكاء) ----------
+        # لو فيه بصمة متطابقة معاه => ده إنسان مش أجسام (حتى لو واقف)
+        # لو مفيش بصمة ليه => ممكن يكون أجسام، نفحص الثبات بس في فترات
+        center_history.setdefault(tid, []).append((cx, cy))
+        age = now - wait_start[tid]
+        is_static = False
+        if not enrolled_match and age > STATIC_AFTER and len(center_history[tid]) >= 2:
+            if now - last_static_check.get(tid, 0) >= STATIC_CHECK_INTERVAL:
+                last_static_check[tid] = now
+                first = center_history[tid][0]
+                moved = max(abs(cx - first[0]), abs(cy - first[1]))
+                if moved < STATIC_MOVE_PX:
+                    is_static = True
+
+        if is_static:
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), GRAY, 2)
+            draw_badge(annotated, "STATIC (not a person)", x1, y1 - 4, GRAY, 0.45)
+            continue
+
+        # ---------- 3) فترة السماح قبل حكم عميل ----------
+        allowed_as_customer = sig_checked.get(tid, False) or (age > CUSTOMER_GRACE)
+
+        if tid not in customer_no and seen_frames[tid] >= MIN_FRAMES and allowed_as_customer:
             customer_no[tid] = next_customer
             next_customer += 1
             print(f"عميل جديد: Customer #{customer_no[tid]}")
 
         if tid not in customer_no:
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), GRAY, 2)
+            draw_badge(annotated, "SCANNING...", x1, y1 - 4, GRAY, 0.45)
             continue
 
         cno = customer_no[tid]
@@ -451,7 +516,7 @@ while True:
         cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
         draw_badge(annotated, label, x1, y1 - 4, color)
 
-    # ---------- خط توصيل التسليم: العميل ↔ الباريستا ----------
+    # ---------- خط توصيل التسليم ----------
     for tid in list(pending.keys()):
         b_tid = pending_barista.get(tid)
         if tid in person_boxes and b_tid in person_boxes:
@@ -494,17 +559,27 @@ while True:
             zone_time.pop(tid, None)
             total_time.pop(tid, None)
             dwell.pop(tid, None)
+            center_history.pop(tid, None)
+            sig_checked.pop(tid, None)
+            last_static_check.pop(tid, None)
 
     cv2.imshow("Cafe Vision", cv2.resize(annotated, (1280, 720)))
     key = cv2.waitKey(1) & 0xFF
     if key == ord('q'):
         break
     elif key == ord(ENROLL_KEY):
-        # 🎓 تسجيل الباريستا: أول شخص موجود في الكادر هو اللي بيتعلم
         if not confirmed:
             print("❌ مفيش حد في الكادر! قف جوه الكادر الأول وبعدين اضغط E")
         else:
-            cand = max(confirmed, key=lambda t: seen_frames.get(t, 0))
+            moving = [t for t in confirmed if not _is_static_now(center_history.get(t, []),
+                                                                 wait_start.get(t, now), now)]
+            if not moving:
+                # لو مفيش حركة، ناخد أول شخص بس من غير شرط (الشخص الواقف برضه شخص)
+                print("⚠️ مفيش حركة واضحة — هنتعلم من أقرب شخص ظاهر (تحرك شوية في المرة الجاية)")
+                cand = max(confirmed, key=lambda t: seen_frames.get(t, 0))
+            else:
+                cand = max(moving, key=lambda t: seen_frames.get(t, 0))
+
             cand_box = person_boxes.get(cand)
             sig = extract_appearance(frame, cand_box) if cand_box is not None else None
             if sig is None:
@@ -512,13 +587,11 @@ while True:
             else:
                 enrolled_signatures.append(sig)
                 save_signatures()
-                # مسح أي أثر إنه كان عميل
                 customer_no.pop(cand, None)
                 wait_start.pop(cand, None)
                 dwell.pop(cand, None)
                 pending.pop(cand, None)
                 pending_barista.pop(cand, None)
-                # رقم ثابت: البصمة الجديدة = ترتيبها في القائمة
                 new_bno = len(enrolled_signatures)
                 barista_no[cand] = new_bno
                 announced_baristas.add(new_bno)
